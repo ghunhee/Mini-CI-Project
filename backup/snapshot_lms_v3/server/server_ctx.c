@@ -1,0 +1,219 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#include "server_ctx.h"
+
+/* 전역 인스턴스 정의 */
+ServerContext g_ctx;
+
+/* ── 내부 헬퍼: 디렉토리가 없으면 생성 (0755) ── */
+static int ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) return 0;
+    if (mkdir(path, 0755) < 0 && errno != EEXIST) {
+        perror("[ctx] mkdir");
+        return -1;
+    }
+    return 0;
+}
+
+/* ── 내부 헬퍼: GradeResult → 문자열 ── */
+static const char *grade_str(GradeResult r) {
+    switch (r) {
+        case GRADE_AC:  return "AC";
+        case GRADE_WA:  return "WA";
+        case GRADE_TLE: return "TLE";
+        case GRADE_RE:  return "RE";
+        case GRADE_CE:  return "CE";
+        default:        return "UNKNOWN";
+    }
+}
+
+/*
+ * ctx_init()
+ * — 서버 시작 시 main() 에서 단 1회 호출.
+ * — 모든 락 초기화 → 기본 과제 주차(week_1) 설정 → results.csv 열기.
+ */
+void ctx_init(ServerContext *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+
+    /* 락 초기화 */
+    pthread_rwlock_init(&ctx->hw_lock,     NULL);
+    pthread_mutex_init(&ctx->tracker_lock, NULL);
+    pthread_mutex_init(&ctx->csv_lock,     NULL);
+    pthread_mutex_init(&ctx->state_lock,   NULL);
+
+    /* [기능 2] 기본 과제 주차 설정 (내부적으로 디렉토리도 생성) */
+    ctx_set_hw(ctx, "week_1");
+
+    /* 기본 서버 파라미터 */
+    ctx->paused          = 0;
+    ctx->timeout_ms      = 5000;  /* 기본 타임아웃 5초 */
+    ctx->total_students  = 0;
+    ctx->submitted_count = 0;
+
+    /* [기능 4] results.csv 열기 (append 모드, 없으면 생성) */
+    pthread_mutex_lock(&ctx->csv_lock);
+    {
+        int need_header = (access(CSV_PATH, F_OK) != 0);
+
+        ctx->csv.csv_fd = open(CSV_PATH,
+                               O_WRONLY | O_CREAT | O_APPEND,
+                               0644);
+        if (ctx->csv.csv_fd < 0) {
+            perror("[ctx] open results.csv");
+        } else if (need_header) {
+            const char *hdr =
+                "Timestamp,Student_ID,Assignment_Week,"
+                "Result,ExecTime_ms,Memory_KB\n";
+            if (write(ctx->csv.csv_fd, hdr, strlen(hdr)) < 0) {}
+            ctx->csv.total_records = 0;
+            fprintf(stderr, "[ctx] results.csv 생성 완료\n");
+        } else {
+            ctx->csv.total_records = 0;
+        }
+    }
+    pthread_mutex_unlock(&ctx->csv_lock);
+
+    fprintf(stderr, "[ctx] ServerContext 초기화 완료 — %s\n", ctx->current_hw);
+}
+
+/*
+ * ctx_set_hw()
+ * — [기능 2] 다운타임 없이 과제 주차를 즉시 전환.
+ * — rwlock write 로 경로 3개를 원자적으로 교체.
+ */
+void ctx_set_hw(ServerContext *ctx, const char *week_name) {
+    if (!week_name || strlen(week_name) == 0 ||
+        strlen(week_name) >= MAX_WEEK_NAME) {
+        fprintf(stderr, "[ctx] set_hw: 잘못된 week_name\n");
+        return;
+    }
+
+    pthread_rwlock_wrlock(&ctx->hw_lock);
+    {
+        strncpy(ctx->current_hw, week_name, MAX_WEEK_NAME - 1);
+        ctx->current_hw[MAX_WEEK_NAME - 1] = '\0';
+
+        snprintf(ctx->ans_path, sizeof(ctx->ans_path),
+                 "%s_ans.txt", week_name);
+
+        snprintf(ctx->submit_dir, sizeof(ctx->submit_dir),
+                 "%s/%s", SUBMISSIONS_DIR, week_name);
+    }
+    pthread_rwlock_unlock(&ctx->hw_lock);
+
+    ensure_dir(SUBMISSIONS_DIR);
+    ensure_dir(ctx->submit_dir);
+
+    fprintf(stderr, "[ctx] 과제 전환: %s | 정답지: %s | 제출폴더: %s\n",
+            ctx->current_hw, ctx->ans_path, ctx->submit_dir);
+}
+
+/*
+ * ctx_record_submission()
+ * — [기능 3] 채점 완료 시 워커 스레드가 호출.
+ * — AC 첫 달성 시에만 submitted_count 증가 (중복 카운트 방지).
+ */
+void ctx_record_submission(ServerContext *ctx,
+                           const char    *student_id,
+                           GradeResult    result) {
+    pthread_mutex_lock(&ctx->tracker_lock);
+    {
+        StudentRecord *found = NULL;
+
+        for (int i = 0; i < MAX_STUDENTS; i++) {
+            if (ctx->students[i].student_id[0] == '\0') break;
+            if (strncmp(ctx->students[i].student_id,
+                        student_id, MAX_STUDENT_ID) == 0) {
+                found = &ctx->students[i];
+                break;
+            }
+        }
+
+        if (!found) {
+            for (int i = 0; i < MAX_STUDENTS; i++) {
+                if (ctx->students[i].student_id[0] == '\0') {
+                    found = &ctx->students[i];
+                    strncpy(found->student_id, student_id, MAX_STUDENT_ID - 1);
+                    found->student_id[MAX_STUDENT_ID - 1] = '\0';
+                    found->submitted    = 0;
+                    found->best_result  = GRADE_WA;
+                    found->submit_count = 0;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            fprintf(stderr, "[ctx] 경고: StudentRecord 슬롯 부족\n");
+            pthread_mutex_unlock(&ctx->tracker_lock);
+            return;
+        }
+
+        found->submit_count++;
+        found->last_submit_ts = time(NULL);
+
+        if (result == GRADE_AC && !found->submitted) {
+            found->submitted   = 1;
+            found->best_result = GRADE_AC;
+            ctx->submitted_count++;
+            fprintf(stderr, "[tracker] %s AC 달성! (%u / %u)\n",
+                    student_id, ctx->submitted_count, ctx->total_students);
+        } else if (result != GRADE_AC && found->best_result != GRADE_AC) {
+            found->best_result = result;
+        }
+    }
+    pthread_mutex_unlock(&ctx->tracker_lock);
+}
+
+/*
+ * ctx_write_csv()
+ * — [기능 4] 채점 완료마다 results.csv 에 한 줄 append.
+ *
+ * 출력 포맷:
+ *   Timestamp,Student_ID,Assignment_Week,Result,ExecTime_ms,Memory_KB
+ *   2025-05-24T10:32:01,20240123,week_2,AC,342,1024
+ */
+void ctx_write_csv(ServerContext *ctx,
+                   const char    *student_id,
+                   GradeResult    result,
+                   uint32_t       exec_ms,
+                   uint32_t       mem_kb) {
+    if (ctx->csv.csv_fd < 0) return;
+
+    char ts_buf[32];
+    time_t now    = time(NULL);
+    struct tm *tm = localtime(&now);
+    strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%dT%H:%M:%S", tm);
+
+    char week_snap[MAX_WEEK_NAME];
+    pthread_rwlock_rdlock(&ctx->hw_lock);
+    strncpy(week_snap, ctx->current_hw, MAX_WEEK_NAME - 1);
+    week_snap[MAX_WEEK_NAME - 1] = '\0';
+    pthread_rwlock_unlock(&ctx->hw_lock);
+
+    char line[512];
+    int len = snprintf(line, sizeof(line),
+                       "%s,%s,%s,%s,%u,%u\n",
+                       ts_buf, student_id, week_snap,
+                       grade_str(result), exec_ms, mem_kb);
+
+    pthread_mutex_lock(&ctx->csv_lock);
+    {
+        ssize_t written = write(ctx->csv.csv_fd, line, len);
+        if (written < 0) {
+            perror("[ctx] csv write");
+        } else {
+            ctx->csv.total_records++;
+            ctx->csv.last_write_ts = now;
+        }
+    }
+    pthread_mutex_unlock(&ctx->csv_lock);
+}
